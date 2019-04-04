@@ -1,0 +1,167 @@
+#!/usr/bin/python
+
+# Program Summary
+# This script gets HTTP requests from Arduino Loggers and processes the requests. 
+# Data received from Arduino Logger is validated and updated in RRD Database.
+# Currently the script support 5 Arduino Loggers, but can be extended in future.
+# One of the parameters sent from Arduino is appKey represented by AK.
+# This appKey is AES encrypted at Arduino end for security purpose and is decrypted in this script
+# appKey contains a 10 digit RequestID which uniquely identfies every request
+# The script also uses a MySql DB to store latest requestID for every Arduino Logger.
+# RequestIDs are stored in logger_info table in ard_logger database in MySql
+
+
+from array import *
+from Crypto.Cipher import AES
+from time import sleep
+import rrdtool
+import cgi,sys
+import cgitb
+cgitb.enable()
+import mysql.connector
+
+#decryption code
+#key 
+IV = 16 * '\x00'           # Initialization vector: 
+mode = AES.MODE_CBC
+
+#dbFilePath = "//"
+dbFilePath = "/"
+dbFileName = ""
+baseID = ""
+loggerID_list = ['01','02','03','04','05'] 
+requestID = ""
+BUFFERCONST = 5
+
+# Function to check request before update in RRD
+# check baseID, loggerID, requestID
+# key is a 16 digit string
+# baseID is a unique 4 digit number shared between Arduino and Python Script 
+# loggerID is a unique 2 digit number assigned every Arduino Logger
+# requestID is a unique 10 digit number unique to every Request coming from Arduino Logger
+def check_request(key):
+  global dbFileName
+  iReq = 0
+  bid = key[:4]
+  lid = key[4:-10]
+  reqid = key[6:]
+  sys.stderr.write("\nbid " + bid) 
+  sys.stderr.write("\nlid " + lid) 
+  sys.stderr.write("\nreqid " + reqid+"\n") 
+  iReq = long(reqid)
+
+  if(bid == baseID):
+    if(lid in loggerID_list): 
+      dbFileName = "voltage_"+lid+".rrd"
+    else: 
+      return False
+  else: 
+    return False   
+  sys.stderr.write("SQL check") 
+
+  #Get Connection to MySQL DB
+  cnx = mysql.connector.connect(user='*', password='*', host='*', database='*')
+  sys.stderr.write("got connection") 
+  #sys.stderr.write(cnx) 
+  cursor = cnx.cursor()
+  sys.stderr.write("got cursor") 
+  #sys.stderr.write(cursor) 
+
+  #reqid = "0000000000", indicates a start of a new transaction.
+  # Just update the MySql database and ignore the data
+  sys.stderr.write("SQL 00000 check") 
+  if(reqid == "0000000000"):
+    sys.stderr.write("0000000000 reqid") 
+    cursor.execute("UPDATE logger_info SET request_id=%(reqID)s WHERE logger_id=%(ardID)s",{'reqID':iReq,'ardID':lid})
+    cnx.commit()
+    cnx.close()
+    return false
+
+  sys.stderr.write("valid request") 
+  #Compare requestID with last RequestId from database
+  cursor.execute("SELECT request_id FROM logger_info WHERE logger_id=%(ardID)s",{'ardID': lid})
+  requestID = cursor.fetchone()
+
+  if(not checkRequestId(long(str(requestID[0])),iReq)):
+    cnx.close()
+    return False
+  else:
+    #Valid RequestID. Store in DB
+    cursor.execute("UPDATE logger_info SET request_id=%(reqID)s WHERE logger_id=%(ardID)s",{'reqID':iReq,'ardID':lid})
+    sys.stderr.write("\n Valid Request, Updated.") 
+    cnx.commit()
+    cnx.close()
+    return True
+  #Database transactions Over.
+
+
+# Function to check validity of RequestID
+# newId is compared with oldId to check the validity of request 
+def checkRequestId(oldId, newId):
+  if(oldId == 0):
+    #special case. Old RequestID is 0. So Allow new requests
+    return True
+  if(newId == 0):
+    #special case. New RequestID is 0. A new Logger is starting. So Allow new requests
+    return True
+  #if(newId <= oldId):
+    #New Request ID is older than previous request stored in DB.
+    #So stale/invalid RequestID. Ignore.
+    #sys.stderr.write("\n Stale Request Id.") 
+    #return False
+  if(newId > (oldId + BUFFERCONST)):
+    #New Resuest ID is much higher than the request ID stored in DB.
+    sys.stderr.write("\n New Request Id too much higher than DB request Id.") 
+    return False 
+  else:
+    #New reuest Id is greater than request Id in DB and also in range.
+    #So correct Id.  
+    sys.stderr.write("\n Request Id is in range.") 
+    return True
+
+def read_all():
+  global dbFilePath, dbFileName 
+  voltage = 0.0
+  battery = 0.0
+  amps = 0.0
+  update1 = "N:"
+  template1 = "voltage:battery:amps"
+  form = cgi.FieldStorage()
+
+  appKey = form.getvalue("AK");
+  #decryptor = AES.new(key, mode, IV=IV)
+  #sys.stderr.write("ENC_KEY="+appKey);
+  #sys.stderr.write("\n");
+
+  #sys.stderr.write("before decode");
+  hexdata = appKey.decode("hex")
+  #sys.stderr.write("after decode");
+
+  decryptor = AES.new(key, mode,IV)
+  plain = decryptor.decrypt(hexdata)
+  sys.stderr.write("APP_KEY="+plain);
+  sys.stderr.write("\n");
+  
+  if(check_request(plain)):
+    voltage = float(form.getvalue("v"))
+    battery = float(form.getvalue("b"))
+    amps = float(form.getvalue("a"))
+    update1 += "%f:%f:%f" %(voltage,battery,amps)
+    sys.stderr.write("update value is "+update1);
+    databaseFile = dbFilePath + dbFileName 
+    sys.stderr.write("db file  "+databaseFile+"\n");
+    rrdtool.update(databaseFile, "--template", template1, update1)
+    sys.stderr.write("RRD UPDATE SUCCESS");
+    print "Content-Type: text/plain;charset=utf-8"
+    print
+    print "OK" 
+  else:
+    sys.stderr.write("ERROR");
+    print "Content-Type: text/plain;charset=utf-8"
+    print
+    print "ERROR" 
+
+read_all()
+#print "Content-Type: text/plain;charset=utf-8"
+#print
+#print "OK" 
